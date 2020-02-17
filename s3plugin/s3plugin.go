@@ -39,6 +39,7 @@ const (
 // 8 MB per part, supporting a file size up to 5TB
 const DownloadChunkSize = int64(units.Mebibyte) * 8
 const UploadChunkSize = int64(units.Mebibyte) * 8
+const Concurrency = 8
 
 type PluginConfig struct {
 	ExecutablePath string
@@ -60,11 +61,14 @@ func SetupPluginForBackup(c *cli.Context) error {
 	_, timestamp := filepath.Split(localBackupDir)
 	testFilePath := fmt.Sprintf("%s/gpbackup_%s_report", localBackupDir, timestamp)
 	fileKey := GetS3Path(config.Options["folder"], testFilePath)
-	reader := strings.NewReader("") // dummy empty reader for probe
-	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, reader)
-	if err == nil {
-		gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileKey)
+	file, err := os.Create(testFilePath) // dummy empty reader for probe
+	defer func() {
+		_ = file.Close()
+	}()
+	if err != nil {
+		return err
 	}
+	_, err = uploadFile(sess, config.Options["bucket"], fileKey, file)
 	return err
 }
 
@@ -91,14 +95,14 @@ func BackupFile(c *cli.Context) error {
 	}
 	filename := c.Args().Get(1)
 	fileKey := GetS3Path(config.Options["folder"], filename)
-	reader, err := os.Open(filename)
+	file, err := os.Open(filename)
 	defer func() {
-		_ = reader.Close()
+		_ = file.Close()
 	}()
 	if err != nil {
 		return err
 	}
-	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, reader)
+	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, file)
 	if err == nil {
 		gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileKey)
 	}
@@ -113,14 +117,14 @@ func RestoreFile(c *cli.Context) error {
 	}
 	filename := c.Args().Get(1)
 	fileKey := GetS3Path(config.Options["folder"], filename)
-	writer, err := os.Create(filename)
+	file, err := os.Create(filename)
 	defer func() {
-		_ = writer.Close()
+		_ = file.Close()
 	}()
 	if err != nil {
 		return err
 	}
-	_, err = downloadFile(sess, config.Options["bucket"], fileKey, writer)
+	_, err = downloadFile(sess, config.Options["bucket"], fileKey, file)
 	if err != nil {
 		_ = os.Remove(filename)
 	}
@@ -135,8 +139,7 @@ func BackupData(c *cli.Context) error {
 	}
 	dataFile := c.Args().Get(1)
 	fileKey := GetS3Path(config.Options["folder"], dataFile)
-	reader := bufio.NewReader(os.Stdin)
-	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, reader)
+	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, os.Stdin)
 	if err == nil {
 		gplog.Verbose("Uploaded %d bytes for file %s", totalBytes, fileKey)
 	}
@@ -241,15 +244,15 @@ func ShouldEnableEncryption(config *PluginConfig) bool {
 	return !isOff
 }
 
-func uploadFile(sess *session.Session, bucket string, fileKey string, fileReader io.Reader) (int64, error) {
+func uploadFile(sess *session.Session, bucket string, fileKey string, file *os.File) (int64, error) {
 	uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
 		u.PartSize = UploadChunkSize
-		u.Concurrency = 16
+		u.Concurrency = Concurrency
 	})
 	_, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(fileKey),
-		Body:   fileReader,
+		Body:   bufio.NewReader(file),
 	})
 	if err != nil {
 		return 0, err
@@ -263,10 +266,10 @@ func uploadFile(sess *session.Session, bucket string, fileKey string, fileReader
 func downloadFile(sess *session.Session, bucket string, fileKey string, file *os.File) (int64, error) {
 	downloader := s3manager.NewDownloader(sess, func(d *s3manager.Downloader) {
 		d.PartSize = DownloadChunkSize
-		d.Concurrency = 16
+		d.Concurrency = Concurrency
 	})
 	buff := &aws.WriteAtBuffer{}
-	totalBytes, err := downloader.Download(buff, &s3.GetObjectInput{
+	_, err := downloader.Download(buff, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(fileKey),
 	})
@@ -274,8 +277,7 @@ func downloadFile(sess *session.Session, bucket string, fileKey string, file *os
 		gplog.Error(fmt.Sprintf("Error downloading %s: %v", fileKey, err))
 		return 0, err
 	}
-	_, err = io.Copy(file, bytes.NewReader(buff.Bytes()))
-	return totalBytes, err
+	return io.Copy(file, bytes.NewReader(buff.Bytes()))
 }
 
 func getFileSize(S3 s3iface.S3API, bucket string, fileKey string) (int64, error) {
