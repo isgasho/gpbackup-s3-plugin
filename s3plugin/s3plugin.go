@@ -2,6 +2,7 @@ package s3plugin
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -10,10 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-
-	"bytes"
-	"math"
-	"sync"
 
 	"github.com/alecthomas/units"
 	"github.com/aws/aws-sdk-go/aws"
@@ -56,18 +53,18 @@ func SetupPluginForBackup(c *cli.Context) error {
 
 	gplog.InitializeLogging("gpbackup", "")
 	config, sess, err := readConfigAndStartSession(c)
-	if err == nil {
-		localBackupDir := c.Args().Get(1)
-		_, timestamp := filepath.Split(localBackupDir)
-		testFilePath := fmt.Sprintf("%s/gpbackup_%s_report", localBackupDir, timestamp)
-		fileKey := GetS3Path(config.Options["folder"], testFilePath)
-		reader := strings.NewReader("") // dummy empty reader for probe
-		totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, reader)
-		if err == nil {
-			gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileKey)
-		}
+	if err != nil {
+		return err
 	}
-
+	localBackupDir := c.Args().Get(1)
+	_, timestamp := filepath.Split(localBackupDir)
+	testFilePath := fmt.Sprintf("%s/gpbackup_%s_report", localBackupDir, timestamp)
+	fileKey := GetS3Path(config.Options["folder"], testFilePath)
+	reader := strings.NewReader("") // dummy empty reader for probe
+	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, reader)
+	if err == nil {
+		gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileKey)
+	}
 	return err
 }
 
@@ -87,6 +84,7 @@ func CleanupPlugin(c *cli.Context) error {
 }
 
 func BackupFile(c *cli.Context) error {
+	gplog.InitializeLogging("gpbackup", "")
 	config, sess, err := readConfigAndStartSession(c)
 	if err != nil {
 		return err
@@ -108,6 +106,7 @@ func BackupFile(c *cli.Context) error {
 }
 
 func RestoreFile(c *cli.Context) error {
+	gplog.InitializeLogging("gprestore", "")
 	config, sess, err := readConfigAndStartSession(c)
 	if err != nil {
 		return err
@@ -129,8 +128,9 @@ func RestoreFile(c *cli.Context) error {
 }
 
 func BackupData(c *cli.Context) error {
+	gplog.InitializeLogging("gpbackup", "")
 	config, sess, err := readConfigAndStartSession(c)
-	if err == nil {
+	if err != nil {
 		return err
 	}
 	dataFile := c.Args().Get(1)
@@ -144,8 +144,9 @@ func BackupData(c *cli.Context) error {
 }
 
 func RestoreData(c *cli.Context) error {
+	gplog.InitializeLogging("gprestore", "")
 	config, sess, err := readConfigAndStartSession(c)
-	if err == nil {
+	if err != nil {
 		return err
 	}
 	dataFile := c.Args().Get(1)
@@ -214,12 +215,18 @@ func readConfigAndStartSession(c *cli.Context) (*PluginConfig, *session.Session,
 	}
 	disableSSL := !ShouldEnableEncryption(config)
 
-	awsConfig := aws.NewConfig().WithRegion(config.Options["region"]).WithEndpoint(config.Options["endpoint"]).WithS3ForcePathStyle(true).WithDisableSSL(disableSSL)
+	awsConfig := aws.NewConfig().
+		WithRegion(config.Options["region"]).
+		WithEndpoint(config.Options["endpoint"]).
+		WithS3ForcePathStyle(true).
+		WithDisableSSL(disableSSL)
 
 	// Will use default credential chain if none provided
 	if config.Options["aws_access_key_id"] != "" {
-		awsConfig = awsConfig.WithCredentials(credentials.NewStaticCredentials(config.Options["aws_access_key_id"],
-			config.Options["aws_secret_access_key"], ""))
+		awsConfig = awsConfig.WithCredentials(
+			credentials.NewStaticCredentials(
+				config.Options["aws_access_key_id"],
+				config.Options["aws_secret_access_key"], ""))
 	}
 
 	sess, err := session.NewSession(awsConfig)
@@ -237,6 +244,7 @@ func ShouldEnableEncryption(config *PluginConfig) bool {
 func uploadFile(sess *session.Session, bucket string, fileKey string, fileReader io.Reader) (int64, error) {
 	uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
 		u.PartSize = UploadChunkSize
+		u.Concurrency = 16
 	})
 	_, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(bucket),
@@ -252,61 +260,22 @@ func uploadFile(sess *session.Session, bucket string, fileKey string, fileReader
 /*
  * Performs ranged requests for the file while exploiting parallelism between the copy and download tasks
  */
-func downloadFile(sess *session.Session, bucket string, fileKey string, fileWriter io.Writer) (int64, error) {
-	var finalErr error
-	downloader := s3manager.NewDownloader(sess)
-
-	totalBytes, err := getFileSize(downloader.S3, bucket, fileKey)
+func downloadFile(sess *session.Session, bucket string, fileKey string, file *os.File) (int64, error) {
+	downloader := s3manager.NewDownloader(sess, func(d *s3manager.Downloader) {
+		d.PartSize = DownloadChunkSize
+		d.Concurrency = 16
+	})
+	buff := &aws.WriteAtBuffer{}
+	totalBytes, err := downloader.Download(buff, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(fileKey),
+	})
 	if err != nil {
+		gplog.Error(fmt.Sprintf("Error downloading %s: %v", fileKey, err))
 		return 0, err
 	}
-	noOfChunks := int(math.Ceil(float64(totalBytes) / float64(DownloadChunkSize)))
-	downloadBuffers := make([]*aws.WriteAtBuffer, noOfChunks)
-	for i := 0; i < noOfChunks; i++ {
-		downloadBuffers[i] = &aws.WriteAtBuffer{GrowthCoeff: 2}
-	}
-	copyChannel := make(chan int)
-
-	waitGroup := sync.WaitGroup{}
-
-	go func() {
-		for currChunk := range copyChannel {
-			_, err = io.Copy(fileWriter, bytes.NewReader(downloadBuffers[currChunk].Bytes()))
-			if err != nil {
-				finalErr = err
-			}
-			waitGroup.Done()
-		}
-	}()
-
-	startByte := int64(0)
-	endByte := DownloadChunkSize - 1
-	for currentChunkNo := 0; currentChunkNo < noOfChunks; currentChunkNo++ {
-		if endByte > totalBytes {
-			endByte = totalBytes
-		}
-		_, err := downloader.Download(downloadBuffers[currentChunkNo], &s3.GetObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(fileKey),
-			Range:  aws.String(fmt.Sprintf("bytes=%d-%d", startByte, endByte)),
-		})
-		if err != nil {
-			finalErr = err
-			break
-		}
-
-		waitGroup.Add(1)
-
-		copyChannel <- currentChunkNo
-
-		startByte += DownloadChunkSize
-		endByte += DownloadChunkSize
-	}
-	close(copyChannel)
-
-	waitGroup.Wait()
-
-	return totalBytes, finalErr
+	_, err = io.Copy(file, bytes.NewReader(buff.Bytes()))
+	return totalBytes, err
 }
 
 func getFileSize(S3 s3iface.S3API, bucket string, fileKey string) (int64, error) {
