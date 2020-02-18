@@ -252,7 +252,7 @@ func uploadFile(sess *session.Session, bucket string, fileKey string, file *os.F
 	_, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(fileKey),
-		Body:   bufio.NewReader(file),
+		Body:   bufio.NewReaderSize(file, 32 * 1024 * 1024),
 	})
 	if err != nil {
 		return 0, err
@@ -268,8 +268,13 @@ func downloadFile(sess *session.Session, bucket string, fileKey string, file *os
 		d.PartSize = DownloadChunkSize
 		d.Concurrency = Concurrency
 	})
-	buff := &aws.WriteAtBuffer{}
-	_, err := downloader.Download(buff, &s3.GetObjectInput{
+	totalBytes, err := getFileSize(downloader.S3, bucket, fileKey)
+	if err != nil {
+		return 0, err
+	}
+	//buff := &aws.WriteAtBuffer{GrowthCoeff: 2}
+	buff := aws.NewWriteAtBuffer(make([]byte, totalBytes))
+	_, err = downloader.Download(buff, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(fileKey),
 	})
