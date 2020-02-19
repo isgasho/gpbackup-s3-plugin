@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/alecthomas/units"
 	"github.com/aws/aws-sdk-go/aws"
@@ -252,7 +254,7 @@ func uploadFile(sess *session.Session, bucket string, fileKey string, file *os.F
 	_, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(fileKey),
-		Body:   bufio.NewReaderSize(file, 32 * 1024 * 1024),
+		Body:   bufio.NewReaderSize(file, int(UploadChunkSize) * Concurrency),
 	})
 	if err != nil {
 		return 0, err
@@ -264,25 +266,57 @@ func uploadFile(sess *session.Session, bucket string, fileKey string, file *os.F
  * Performs ranged requests for the file while exploiting parallelism between the copy and download tasks
  */
 func downloadFile(sess *session.Session, bucket string, fileKey string, file *os.File) (int64, error) {
-	downloader := s3manager.NewDownloader(sess, func(d *s3manager.Downloader) {
-		d.PartSize = DownloadChunkSize
-		d.Concurrency = Concurrency
-	})
+	var finalErr error
+	downloader := s3manager.NewDownloader(sess)
+
 	totalBytes, err := getFileSize(downloader.S3, bucket, fileKey)
 	if err != nil {
 		return 0, err
 	}
-	//buff := &aws.WriteAtBuffer{GrowthCoeff: 2}
-	buff := aws.NewWriteAtBuffer(make([]byte, totalBytes))
-	_, err = downloader.Download(buff, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(fileKey),
-	})
-	if err != nil {
-		gplog.Error(fmt.Sprintf("Error downloading %s: %v", fileKey, err))
-		return 0, err
+	noOfChunks := int(math.Ceil(float64(totalBytes) / float64(DownloadChunkSize)))
+	downloadBuffers := make([]*aws.WriteAtBuffer, noOfChunks)
+	copyChannel := make(chan int)
+	waitGroup := sync.WaitGroup{}
+
+	go func() {
+		for currChunk := range copyChannel {
+			_, err = io.Copy(file, bytes.NewReader(downloadBuffers[currChunk].Bytes()))
+			if err != nil {
+				finalErr = err
+			}
+			waitGroup.Done()
+		}
+	}()
+
+	startByte := int64(0)
+	endByte := DownloadChunkSize - 1
+	for currentChunkNo := 0; currentChunkNo < noOfChunks; currentChunkNo++ {
+		buffer := make([]byte, DownloadChunkSize)
+		downloadBuffers[currentChunkNo] = aws.NewWriteAtBuffer(buffer)
+		if endByte > totalBytes {
+			endByte = totalBytes
+		}
+		go func() {
+			_, err := downloader.Download(downloadBuffers[currentChunkNo], &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(fileKey),
+				Range:  aws.String(fmt.Sprintf("bytes=%d-%d", startByte, endByte)),
+			})
+			if err != nil {
+				finalErr = err
+			}
+			waitGroup.Add(1)
+		}()
+
+		copyChannel <- currentChunkNo
+		startByte += DownloadChunkSize
+		endByte += DownloadChunkSize
 	}
-	return io.Copy(file, bytes.NewReader(buff.Bytes()))
+	close(copyChannel)
+
+	waitGroup.Wait()
+
+	return totalBytes, finalErr
 }
 
 func getFileSize(S3 s3iface.S3API, bucket string, fileKey string) (int64, error) {
