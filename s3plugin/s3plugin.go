@@ -38,7 +38,7 @@ const (
 	Segment     Scope = "segment"
 )
 
-// 8 MB per part, supporting a file size up to 5TB
+// 8 MB per part, supporting a file size up to 80GB
 const DownloadChunkSize = int64(units.Mebibyte) * 8
 const UploadChunkSize = int64(units.Mebibyte) * 8
 const Concurrency = 8
@@ -273,47 +273,54 @@ func downloadFile(sess *session.Session, bucket string, fileKey string, file *os
 	if err != nil {
 		return 0, err
 	}
+	gplog.Verbose("File %s size = %d bytes", fileKey, totalBytes)
 	noOfChunks := int(math.Ceil(float64(totalBytes) / float64(DownloadChunkSize)))
 	downloadBuffers := make([]*aws.WriteAtBuffer, noOfChunks)
-	copyChannel := make(chan int)
+	copyChannel := make([]chan int, noOfChunks)
+	for i := range copyChannel {
+		copyChannel[i] = make(chan int)
+	}
+
 	waitGroup := sync.WaitGroup{}
 
 	go func() {
-		for currChunk := range copyChannel {
-			_, err = io.Copy(file, bytes.NewReader(downloadBuffers[currChunk].Bytes()))
+		for i := range copyChannel {
+			currChunk := <- copyChannel[i]
+			written, err := io.Copy(file, bytes.NewReader(downloadBuffers[currChunk].Bytes()))
 			if err != nil {
 				finalErr = err
 			}
+			gplog.Verbose("Copied %d bytes for chunk %d", written, currChunk)
 			waitGroup.Done()
+			close(copyChannel[i])
 		}
 	}()
 
 	startByte := int64(0)
 	endByte := DownloadChunkSize - 1
 	for currentChunkNo := 0; currentChunkNo < noOfChunks; currentChunkNo++ {
-		buffer := make([]byte, DownloadChunkSize)
-		downloadBuffers[currentChunkNo] = aws.NewWriteAtBuffer(buffer)
-		if endByte > totalBytes {
-			endByte = totalBytes
+		if endByte >= totalBytes {
+			endByte = totalBytes - 1
 		}
-		go func() {
-			_, err := downloader.Download(downloadBuffers[currentChunkNo], &s3.GetObjectInput{
+		buffer := make([]byte, endByte - startByte + 1)
+		downloadBuffers[currentChunkNo] = aws.NewWriteAtBuffer(buffer)
+		go func(chunkNo int, ChunkStart int64, chunkEnd int64) {
+			chunkBytes, err := downloader.Download(downloadBuffers[chunkNo], &s3.GetObjectInput{
 				Bucket: aws.String(bucket),
 				Key:    aws.String(fileKey),
-				Range:  aws.String(fmt.Sprintf("bytes=%d-%d", startByte, endByte)),
+				Range:  aws.String(fmt.Sprintf("bytes=%d-%d", ChunkStart, chunkEnd)),
 			})
 			if err != nil {
 				finalErr = err
 			}
-			waitGroup.Add(1)
-		}()
+			gplog.Verbose("Downloaded %d bytes for chunk %d", chunkBytes, chunkNo)
+			copyChannel[chunkNo] <- chunkNo
+		}(currentChunkNo, startByte, endByte)
 
-		copyChannel <- currentChunkNo
+		waitGroup.Add(1)
 		startByte += DownloadChunkSize
 		endByte += DownloadChunkSize
 	}
-	close(copyChannel)
-
 	waitGroup.Wait()
 
 	return totalBytes, finalErr
