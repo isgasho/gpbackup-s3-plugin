@@ -134,6 +134,47 @@ func RestoreFile(c *cli.Context) error {
 	return err
 }
 
+func RestoreDirectory(c *cli.Context) error {
+	gplog.InitializeLogging("gprestore", "")
+	config, sess, err := readConfigAndStartSession(c)
+	if err != nil {
+		return err
+	}
+	dirname := c.Args().Get(1)
+	bucket := config.Options["bucket"]
+	dirKey := GetS3Path(config.Options["folder"], dirname)
+	_ = os.MkdirAll(dirname, 0775)
+	fmt.Printf("dirKey = %s\n", dirKey)
+	client := s3.New(sess)
+	params := &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &dirKey}
+	bucketObjectsList, _ := client.ListObjectsV2(params)
+
+	for _, key := range bucketObjectsList.Contents {
+		var filename string
+		fmt.Printf("file %s = %d bytes\n", *key.Key, *key.Size)
+		if strings.HasSuffix(*key.Key, "/") {
+			// Got a directory
+			continue
+		}
+		if strings.Contains(*key.Key, "/") {
+			// split
+			s3FileFullPathList := strings.Split(*key.Key, "/")
+			filename = s3FileFullPathList[len(s3FileFullPathList)-1]
+		}
+		filePath := dirname + filename
+		file, err := os.Create(filePath)
+		if err != nil {
+			return err
+		}
+		_, err = downloadFile(sess, config.Options["bucket"], *key.Key, file)
+		if err != nil {
+			_ = os.Remove(filename)
+		}
+		_ = file.Close()
+	}
+	return err
+}
+
 func BackupData(c *cli.Context) error {
 	gplog.InitializeLogging("gpbackup", "")
 	config, sess, err := readConfigAndStartSession(c)
@@ -318,9 +359,11 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 	}
 
 	startByte := int64(0)
-	endByte := DownloadChunkSize - 1
+	endByte := int64(-1)
 	done := false
-	for currentChunkNo := 0; currentChunkNo < noOfChunks || !done; currentChunkNo++ {
+	for currentChunkNo := 0; currentChunkNo < noOfChunks && !done; currentChunkNo++ {
+		startByte = endByte + 1
+		endByte += DownloadChunkSize + int64(currentChunkNo) * DownloadChunkIncrement
 		if endByte >= totalBytes {
 			endByte = totalBytes - 1
 			done = true
@@ -332,8 +375,6 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 			endByte,
 		}
 		waitGroup.Add(1)
-		startByte += DownloadChunkSize + int64(currentChunkNo) * DownloadChunkIncrement
-		endByte += DownloadChunkSize + int64(currentChunkNo) * DownloadChunkIncrement
 	}
 
 	waitGroup.Wait()
