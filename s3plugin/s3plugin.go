@@ -319,9 +319,11 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 
 	startByte := int64(0)
 	endByte := DownloadChunkSize - 1
-	for currentChunkNo := 0; currentChunkNo < noOfChunks; currentChunkNo++ {
+	done := false
+	for currentChunkNo := 0; currentChunkNo < noOfChunks || !done; currentChunkNo++ {
 		if endByte >= totalBytes {
 			endByte = totalBytes - 1
+			done = true
 		}
 		downloadBuffers[currentChunkNo] = &aws.WriteAtBuffer{GrowthCoeff: 2}
 		jobs <- chunk{
