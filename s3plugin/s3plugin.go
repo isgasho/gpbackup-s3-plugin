@@ -40,6 +40,7 @@ const (
 
 // 8 MB per part, supporting a file size up to 80GB
 const DownloadChunkSize = int64(units.Mebibyte) * 8
+const DownloadChunkIncrement = int64(units.Mebibyte) * 2
 const UploadChunkSize = int64(units.Mebibyte) * 8
 const Concurrency = 8
 
@@ -310,7 +311,7 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 				if err != nil {
 					finalErr = err
 				}
-				gplog.Verbose("Worker %d Downloaded %d bytes for chunk %d", i, chunkBytes, j.chunkNo)
+				gplog.Verbose("Worker %d Downloaded %d bytes for chunk %d", id, chunkBytes, j.chunkNo)
 				copyChannel[j.chunkNo] <- j.chunkNo
 			}
 		}(i)
@@ -329,8 +330,8 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 			endByte,
 		}
 		waitGroup.Add(1)
-		startByte += DownloadChunkSize
-		endByte += DownloadChunkSize
+		startByte += DownloadChunkSize + int64(currentChunkNo) * DownloadChunkIncrement
+		endByte += DownloadChunkSize + int64(currentChunkNo) * DownloadChunkIncrement
 	}
 
 	waitGroup.Wait()
