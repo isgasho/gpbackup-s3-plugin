@@ -46,11 +46,11 @@ func main() {
 			Action: s3plugin.BackupFile,
 			Before: buildBeforeFunc(2),
 		},
-		//{
-		//	Name:   "backup_directory",
-		//	Action: s3plugin.BackupDirectory,
-		//	Before: buildBeforeFunc(2),
-		//},
+		{
+			Name:   "backup_directory",
+			Action: s3plugin.BackupDirectory,
+			Before: buildBeforeFunc(2),
+		},
 		{
 			Name:   "restore_file",
 			Action: s3plugin.RestoreFile,

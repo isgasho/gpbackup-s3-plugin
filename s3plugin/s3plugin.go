@@ -38,12 +38,6 @@ const (
 	Segment     Scope = "segment"
 )
 
-// 8 MB per part, supporting a file size up to 80GB
-const DownloadChunkSize = int64(units.Mebibyte) * 8
-const DownloadChunkIncrement = int64(units.Mebibyte) * 2
-const UploadChunkSize = int64(units.Mebibyte) * 8
-const Concurrency = 8
-
 type PluginConfig struct {
 	ExecutablePath string
 	Options        map[string]string
@@ -86,7 +80,6 @@ func SetupPluginForRestore(c *cli.Context) error {
 }
 
 func CleanupPlugin(c *cli.Context) error {
-	_ = c
 	return nil
 }
 
@@ -108,6 +101,54 @@ func BackupFile(c *cli.Context) error {
 	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, file)
 	if err == nil {
 		gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileKey)
+	}
+	return err
+}
+
+func isDirectory(path string) bool {
+	fd, err := os.Stat(path)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(2)
+	}
+	switch mode := fd.Mode(); {
+	case mode.IsDir():
+		return true
+	case mode.IsRegular():
+		return false
+	}
+	return false
+}
+
+func BackupDirectory(c *cli.Context) error {
+	gplog.InitializeLogging("gpbackup", "")
+	config, sess, err := readConfigAndStartSession(c)
+	if err != nil {
+		return err
+	}
+	dirName := c.Args().Get(1)
+	dirKey := GetS3Path(config.Options["folder"], dirName)
+	fmt.Printf("dirKey = %s\n", dirKey)
+	fileList := make([]string, 0)
+	filepath.Walk(dirName, func(path string, f os.FileInfo, err error) error {
+		if isDirectory(path) {
+			// Do nothing
+			return nil
+		} else {
+			fileList = append(fileList, path)
+			return nil
+		}
+	})
+	for _, fileName := range fileList {
+		file, err := os.Open(fileName)
+		if err != nil {
+			return err
+		}
+		totalBytes, err := uploadFile(sess, config.Options["bucket"], fileName, file)
+		if err == nil {
+			gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileName)
+		}
+		_ = file.Close()
 	}
 	return err
 }
@@ -140,10 +181,10 @@ func RestoreDirectory(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	dirname := c.Args().Get(1)
+	dirName := c.Args().Get(1)
 	bucket := config.Options["bucket"]
-	dirKey := GetS3Path(config.Options["folder"], dirname)
-	_ = os.MkdirAll(dirname, 0775)
+	dirKey := GetS3Path(config.Options["folder"], dirName)
+	_ = os.MkdirAll(dirName, 0775)
 	fmt.Printf("dirKey = %s\n", dirKey)
 	client := s3.New(sess)
 	params := &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &dirKey}
@@ -161,7 +202,7 @@ func RestoreDirectory(c *cli.Context) error {
 			s3FileFullPathList := strings.Split(*key.Key, "/")
 			filename = s3FileFullPathList[len(s3FileFullPathList)-1]
 		}
-		filePath := dirname + filename
+		filePath := dirName + filename
 		file, err := os.Create(filePath)
 		if err != nil {
 			return err
@@ -288,7 +329,15 @@ func ShouldEnableEncryption(config *PluginConfig) bool {
 	return !isOff
 }
 
-func uploadFile(sess *session.Session, bucket string, fileKey string, file *os.File) (int64, error) {
+// 8 MB per part, supporting a file size up to 80GB
+const DownloadChunkSize = int64(units.Mebibyte) * 8
+const DownloadChunkIncrement = int64(units.Mebibyte) * 2
+const UploadChunkSize = int64(units.Mebibyte) * 8
+const Concurrency = 8
+
+func uploadFile(sess *session.Session, bucket string,
+	fileKey string, file *os.File) (int64, error) {
+
 	uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
 		u.PartSize = UploadChunkSize
 		u.Concurrency = Concurrency
@@ -308,6 +357,32 @@ type chunk struct {
 	chunkNo   int
 	startByte int64
 	endByte   int64
+}
+
+/*
+ * Performs ranged requests for the file while exploiting parallelism between the copy and download tasks
+ */
+func downloadFile(sess *session.Session, bucket string,
+	fileKey string, file *os.File) (int64, error) {
+	downloader := s3manager.NewDownloader(sess)
+
+	totalBytes, err := getFileSize(downloader.S3, bucket, fileKey)
+	if err != nil {
+		return 0, err
+	}
+	gplog.Verbose("File %s size = %d bytes", fileKey, totalBytes)
+	if totalBytes <= DownloadChunkSize {
+		_, err = downloader.Download(
+			file,
+			&s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(fileKey),
+			})
+	} else {
+		return downloadFileInParallel(downloader, totalBytes, bucket, fileKey, file)
+	}
+
+	return totalBytes, err
 }
 
 /*
@@ -381,31 +456,6 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 	return totalBytes, finalErr
 }
 
-/*
- * Performs ranged requests for the file while exploiting parallelism between the copy and download tasks
- */
-func downloadFile(sess *session.Session, bucket string, fileKey string, file *os.File) (int64, error) {
-	downloader := s3manager.NewDownloader(sess)
-
-	totalBytes, err := getFileSize(downloader.S3, bucket, fileKey)
-	if err != nil {
-		return 0, err
-	}
-	gplog.Verbose("File %s size = %d bytes", fileKey, totalBytes)
-	if totalBytes <= DownloadChunkSize {
-		_, err = downloader.Download(
-			file,
-			&s3.GetObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(fileKey),
-			})
-	} else {
-		return downloadFileInParallel(downloader, totalBytes, bucket, fileKey, file)
-	}
-
-	return totalBytes, err
-}
-
 func getFileSize(S3 s3iface.S3API, bucket string, fileKey string) (int64, error) {
 	req, resp := S3.HeadObjectRequest(&s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
@@ -422,7 +472,8 @@ func getFileSize(S3 s3iface.S3API, bucket string, fileKey string) (int64, error)
 func GetS3Path(folder string, path string) string {
 	/*
 		a typical path for an already-backed-up file will be stored in a
-		parent directory of a segment, and beneath that, under a datestamp/timestamp/ hierarchy. We assume the incoming path is a long absolute one.
+		parent directory of a segment, and beneath that, under a datestamp/timestamp/
+	    hierarchy. We assume the incoming path is a long absolute one.
 		For example from the test bench:
 		  testdir_for_del="/tmp/testseg/backups/$current_date_for_del/$time_second_for_del"
 		  testfile_for_del="$testdir_for_del/testfile_$time_second_for_del.txt"
@@ -442,7 +493,8 @@ func Delete(c *cli.Context) error {
 	}
 
 	if !IsValidTimestamp(timestamp) {
-		return fmt.Errorf("delete requires a <timestamp> with format YYYYMMDDHHMMSS, but received: %s", timestamp)
+		return fmt.Errorf("delete requires a <timestamp> with format " +
+			"YYYYMMDDHHMMSS, but received: %s", timestamp)
 	}
 
 	date := timestamp[0:8]
