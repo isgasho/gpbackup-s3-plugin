@@ -89,9 +89,9 @@ func BackupFile(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	filename := c.Args().Get(1)
-	fileKey := GetS3Path(config.Options["folder"], filename)
-	file, err := os.Open(filename)
+	fileName := c.Args().Get(1)
+	fileKey := GetS3Path(config.Options["folder"], fileName)
+	file, err := os.Open(fileName)
 	defer func() {
 		_ = file.Close()
 	}()
@@ -105,19 +105,19 @@ func BackupFile(c *cli.Context) error {
 	return err
 }
 
-func isDirectory(path string) bool {
+func isDirectoryGetSize(path string) (bool, int64) {
 	fd, err := os.Stat(path)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(2)
+		gplog.FatalOnError(err)
 	}
 	switch mode := fd.Mode(); {
 	case mode.IsDir():
-		return true
+		return true, 0
 	case mode.IsRegular():
-		return false
+		return false, fd.Size()
 	}
-	return false
+	gplog.FatalOnError(errors.New(fmt.Sprintf("INVALID file %s", path)))
+	return false, 0
 }
 
 func BackupDirectory(c *cli.Context) error {
@@ -127,30 +127,47 @@ func BackupDirectory(c *cli.Context) error {
 		return err
 	}
 	dirName := c.Args().Get(1)
-	dirKey := GetS3Path(config.Options["folder"], dirName)
-	fmt.Printf("dirKey = %s\n", dirKey)
+	bucket := config.Options["bucket"]
+	folder := config.Options["folder"]
+	dirKey := folder + "/" + dirName
+	gplog.Verbose("Backup Directory '%s' to S3", dirName)
+	gplog.Verbose("S3 Location = s3://%s/%s", bucket, dirKey)
+
+	// Create a list of files to be backed up
 	fileList := make([]string, 0)
-	filepath.Walk(dirName, func(path string, f os.FileInfo, err error) error {
-		if isDirectory(path) {
-			// Do nothing
-			return nil
-		} else {
+	_ = filepath.Walk(dirName, func(path string, f os.FileInfo, err error) error {
+		isDir, size := isDirectoryGetSize(path)
+		if !isDir {
+			gplog.Verbose("File '%s' = %d bytes", filepath.Base(path), size)
 			fileList = append(fileList, path)
-			return nil
 		}
+		return nil
 	})
+
+	// Process the files in parallel
+	var wg sync.WaitGroup
+	var finalErr error
 	for _, fileName := range fileList {
-		file, err := os.Open(fileName)
-		if err != nil {
-			return err
-		}
-		totalBytes, err := uploadFile(sess, config.Options["bucket"], fileName, file)
-		if err == nil {
-			gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileName)
-		}
-		_ = file.Close()
+		wg.Add(1)
+		go func(fileName string) {
+			defer wg.Done()
+			file, err := os.Open(fileName)
+			if err != nil {
+				finalErr = err
+				return
+			}
+			fileKey := folder + "/" + fileName
+			totalBytes, err := uploadFile(sess, bucket, fileKey, file)
+			if err == nil {
+				gplog.Verbose("Uploaded %d bytes for %s", totalBytes, filepath.Base(fileName))
+			} else {
+				finalErr = err
+			}
+			_ = file.Close()
+		}(fileName)
 	}
-	return err
+	wg.Wait()
+	return finalErr
 }
 
 func RestoreFile(c *cli.Context) error {
@@ -159,9 +176,9 @@ func RestoreFile(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	filename := c.Args().Get(1)
-	fileKey := GetS3Path(config.Options["folder"], filename)
-	file, err := os.Create(filename)
+	fileName := c.Args().Get(1)
+	fileKey := GetS3Path(config.Options["folder"], fileName)
+	file, err := os.Create(fileName)
 	defer func() {
 		_ = file.Close()
 	}()
@@ -170,7 +187,7 @@ func RestoreFile(c *cli.Context) error {
 	}
 	_, err = downloadFile(sess, config.Options["bucket"], fileKey, file)
 	if err != nil {
-		_ = os.Remove(filename)
+		_ = os.Remove(fileName)
 	}
 	return err
 }
@@ -183,37 +200,56 @@ func RestoreDirectory(c *cli.Context) error {
 	}
 	dirName := c.Args().Get(1)
 	bucket := config.Options["bucket"]
-	dirKey := GetS3Path(config.Options["folder"], dirName)
+	folder := config.Options["folder"]
+	dirKey := folder + "/" + dirName
+	gplog.Verbose("Restore Directory '%s' from S3", dirName)
+	gplog.Verbose("S3 Location = s3://%s/%s", bucket, dirKey)
 	_ = os.MkdirAll(dirName, 0775)
-	fmt.Printf("dirKey = %s\n", dirKey)
 	client := s3.New(sess)
 	params := &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &dirKey}
 	bucketObjectsList, _ := client.ListObjectsV2(params)
 
+	// Create a list of files to be restored
+	fileList := make([]string, 0)
 	for _, key := range bucketObjectsList.Contents {
-		var filename string
-		fmt.Printf("file %s = %d bytes\n", *key.Key, *key.Size)
+		gplog.Verbose("File '%s' = %d bytes", filepath.Base(*key.Key), *key.Size)
 		if strings.HasSuffix(*key.Key, "/") {
 			// Got a directory
 			continue
 		}
-		if strings.Contains(*key.Key, "/") {
-			// split
-			s3FileFullPathList := strings.Split(*key.Key, "/")
-			filename = s3FileFullPathList[len(s3FileFullPathList)-1]
-		}
-		filePath := dirName + filename
-		file, err := os.Create(filePath)
-		if err != nil {
-			return err
-		}
-		_, err = downloadFile(sess, config.Options["bucket"], *key.Key, file)
-		if err != nil {
-			_ = os.Remove(filename)
-		}
-		_ = file.Close()
+		fileList = append(fileList, *key.Key)
 	}
-	return err
+
+	// Process the files in parallel
+	var wg sync.WaitGroup
+	var finalErr error
+	for _, fileKey := range fileList {
+		wg.Add(1)
+		go func(fileKey string) {
+			defer wg.Done()
+			fileName := fileKey
+			if strings.Contains(fileKey, "/") {
+				fileName = filepath.Base(fileKey)
+			}
+			// construct local file name
+			filePath := dirName + "/" + fileName
+			file, err := os.Create(filePath)
+			if err != nil {
+				finalErr = err
+				return
+			}
+			totalBytes, err := downloadFile(sess, bucket, fileKey, file)
+			if err == nil {
+				gplog.Verbose("Downloaded %d bytes for file %s", totalBytes, fileName)
+			} else {
+				finalErr = err
+				_ = os.Remove(filePath)
+			}
+			_ = file.Close()
+		}(fileKey)
+	}
+	wg.Wait()
+	return finalErr
 }
 
 func BackupData(c *cli.Context) error {
