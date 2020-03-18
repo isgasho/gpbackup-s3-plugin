@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -247,9 +246,14 @@ func ShouldEnableEncryption(config *PluginConfig) bool {
 	return !isOff
 }
 
-// 8 MB per part, supporting a file size up to 80GB
+/*
+     8 MB starting chunk where each subsequent chunk increments by 1MB
+     AWS only allows upto 10000 chunks with Max file size of 5TB
+     The limit would be reached at chunk number 3155 in our case
+     Chunk sizes = 8, 9, 10, ..., 3155
+ */
 const DownloadChunkSize = int64(units.Mebibyte) * 8
-const DownloadChunkIncrement = int64(units.Mebibyte) * 2
+const DownloadChunkIncrement = int64(units.Mebibyte) * 1
 const UploadChunkSize = int64(units.Mebibyte) * 8
 const Concurrency = 8
 
@@ -275,9 +279,19 @@ func uploadFile(sess *session.Session, bucket string, fileKey string,
 }
 
 type chunk struct {
-	chunkNo   int
-	startByte int64
-	endByte   int64
+	chunkIndex int
+	startByte  int64
+	endByte    int64
+}
+
+func calculateNumChunks(size int64) int {
+	currentChunkSize := DownloadChunkSize
+	numChunks := 1
+	for total := size - currentChunkSize; total > 0; total -= currentChunkSize {
+		currentChunkSize += DownloadChunkIncrement
+		numChunks++
+	}
+	return numChunks
 }
 
 /*
@@ -294,7 +308,7 @@ func downloadFile(sess *session.Session, bucket string, fileKey string,
 	if err != nil {
 		return 0, -1, err
 	}
-	gplog.Verbose("File %s size = %d bytes", fileKey, totalBytes)
+	gplog.Verbose("File %s size = %d bytes", filepath.Base(fileKey), totalBytes)
 	if totalBytes <= DownloadChunkSize {
 		_, err = downloader.Download(
 			file,
@@ -317,22 +331,23 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 
 	var finalErr error
 	waitGroup := sync.WaitGroup{}
-	noOfChunks := int(math.Ceil(float64(totalBytes) / float64(DownloadChunkSize)))
-	downloadBuffers := make([]*aws.WriteAtBuffer, noOfChunks)
-	copyChannel := make([]chan int, noOfChunks)
-	jobs := make(chan chunk, noOfChunks)
+	numberOfChunks := calculateNumChunks(totalBytes)
+	downloadBuffers := make([]*aws.WriteAtBuffer, numberOfChunks)
+	copyChannel := make([]chan int, numberOfChunks)
+	jobs := make(chan chunk, numberOfChunks)
 	for i := range copyChannel {
 		copyChannel[i] = make(chan int)
 	}
 
 	go func() {
 		for i := range copyChannel {
-			currChunk := <- copyChannel[i]
-			written, err := io.Copy(file, bytes.NewReader(downloadBuffers[currChunk].Bytes()))
+			currentChunk := <- copyChannel[i]
+			written, err := io.Copy(file, bytes.NewReader(downloadBuffers[currentChunk].Bytes()))
 			if err != nil {
 				finalErr = err
 			}
-			gplog.Verbose("Copied %d bytes for chunk %d", written, currChunk)
+			gplog.Verbose("Copied %d bytes (chunk %d) for file '%s'",
+				written, currentChunk, filepath.Base(fileKey))
 			waitGroup.Done()
 			close(copyChannel[i])
 		}
@@ -342,7 +357,7 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 		go func(id int) {
 			for j := range jobs {
 				chunkBytes, err := downloader.Download(
-					downloadBuffers[j.chunkNo],
+					downloadBuffers[j.chunkIndex],
 					&s3.GetObjectInput{
 						Bucket: aws.String(bucket),
 						Key:    aws.String(fileKey),
@@ -351,8 +366,9 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 				if err != nil {
 					finalErr = err
 				}
-				gplog.Verbose("Worker %d Downloaded %d bytes for chunk %d", id, chunkBytes, j.chunkNo)
-				copyChannel[j.chunkNo] <- j.chunkNo
+				gplog.Verbose("Worker %d Downloaded %d bytes (chunk %d) for file '%s'",
+					id, chunkBytes, j.chunkIndex, filepath.Base(fileKey))
+				copyChannel[j.chunkIndex] <- j.chunkIndex
 			}
 		}(i)
 	}
@@ -360,16 +376,16 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 	startByte := int64(0)
 	endByte := int64(-1)
 	done := false
-	for currentChunkNo := 0; currentChunkNo < noOfChunks && !done; currentChunkNo++ {
+	for chunkIndex := 0; chunkIndex < numberOfChunks && !done; chunkIndex++ {
 		startByte = endByte + 1
-		endByte += DownloadChunkSize + int64(currentChunkNo) * DownloadChunkIncrement
+		endByte += DownloadChunkSize + int64(chunkIndex) * DownloadChunkIncrement
 		if endByte >= totalBytes {
 			endByte = totalBytes - 1
 			done = true
 		}
-		downloadBuffers[currentChunkNo] = &aws.WriteAtBuffer{GrowthCoeff: 2}
+		downloadBuffers[chunkIndex] = &aws.WriteAtBuffer{GrowthCoeff: 2}
 		jobs <- chunk{
-			currentChunkNo,
+			chunkIndex,
 			startByte,
 			endByte,
 		}
