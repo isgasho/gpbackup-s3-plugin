@@ -100,6 +100,8 @@ func BackupFile(c *cli.Context) error {
 	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, file)
 	if err == nil {
 		gplog.Verbose("Uploaded %d bytes for %s", totalBytes, fileKey)
+	} else {
+		gplog.FatalOnError(err)
 	}
 	return err
 }
@@ -121,6 +123,7 @@ func RestoreFile(c *cli.Context) error {
 	}
 	_, err = downloadFile(sess, config.Options["bucket"], fileKey, file)
 	if err != nil {
+		gplog.FatalOnError(err)
 		_ = os.Remove(filename)
 	}
 	return err
@@ -137,6 +140,8 @@ func BackupData(c *cli.Context) error {
 	totalBytes, err := uploadFile(sess, config.Options["bucket"], fileKey, os.Stdin)
 	if err == nil {
 		gplog.Verbose("Uploaded %d bytes for file %s", totalBytes, fileKey)
+	} else {
+		gplog.FatalOnError(err)
 	}
 	return err
 }
@@ -152,6 +157,8 @@ func RestoreData(c *cli.Context) error {
 	totalBytes, err := downloadFile(sess, config.Options["bucket"], fileKey, os.Stdout)
 	if err == nil {
 		gplog.Verbose("Downloaded %d bytes for file %s", totalBytes, fileKey)
+	} else {
+		gplog.FatalOnError(err)
 	}
 	return err
 }
@@ -247,7 +254,7 @@ func ShouldEnableEncryption(config *PluginConfig) bool {
  */
 const DownloadChunkSize = int64(units.Mebibyte) * 8
 const DownloadChunkIncrement = int64(units.Mebibyte) * 1
-const UploadChunkSize = int64(units.Mebibyte) * 8
+const UploadChunkSize = int64(units.Mebibyte) * 500
 const Concurrency = 8
 
 func uploadFile(sess *session.Session, bucket string,
@@ -255,12 +262,11 @@ func uploadFile(sess *session.Session, bucket string,
 
 	uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
 		u.PartSize = UploadChunkSize
-		u.Concurrency = Concurrency
 	})
 	_, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(fileKey),
-		Body:   bufio.NewReaderSize(file, int(UploadChunkSize) * Concurrency),
+		Body:   bufio.NewReader(file),
 	})
 	if err != nil {
 		return 0, err
