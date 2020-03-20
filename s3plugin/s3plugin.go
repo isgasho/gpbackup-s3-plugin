@@ -2,10 +2,8 @@ package s3plugin
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -262,7 +260,7 @@ func ShouldEnableEncryption(config *PluginConfig) bool {
 const DownloadChunkSize = int64(units.Mebibyte) * 8
 const DownloadChunkIncrement = int64(units.Mebibyte) * 1
 const UploadChunkSize = int64(units.Mebibyte) * 500
-const Concurrency = 8
+const Concurrency = 6
 
 func uploadFile(sess *session.Session, bucket string, fileKey string,
 	file *os.File) (int64, time.Duration, error) {
@@ -280,8 +278,7 @@ func uploadFile(sess *session.Session, bucket string, fileKey string,
 		return 0, -1, err
 	}
 	totalBytes, err := getFileSize(uploader.S3, bucket, fileKey)
-	elapsed := time.Since(start)
-    return totalBytes, elapsed, err
+    return totalBytes, time.Since(start), err
 }
 
 type chunk struct {
@@ -306,7 +303,6 @@ func calculateNumChunks(size int64) int {
 func downloadFile(sess *session.Session, bucket string, fileKey string,
 	file *os.File) (int64, time.Duration, error) {
 
-	var finalErr error
 	start := time.Now()
 	downloader := s3manager.NewDownloader(sess)
 
@@ -325,63 +321,30 @@ func downloadFile(sess *session.Session, bucket string, fileKey string,
 	} else {
 		return downloadFileInParallel(downloader, totalBytes, bucket, fileKey, file)
 	}
-
-	return totalBytes, err
+	return totalBytes, time.Since(start), err
 }
 
 /*
  * Performs ranged requests for the file while exploiting parallelism between the copy and download tasks
  */
 func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
-	bucket string, fileKey string, file *os.File) (int64, error) {
+	bucket string, fileKey string, file *os.File) (int64, time.Duration, error) {
 
 	var finalErr error
+	start := time.Now()
 	waitGroup := sync.WaitGroup{}
 	numberOfChunks := calculateNumChunks(totalBytes)
 	downloadBuffers := make([]*aws.WriteAtBuffer, numberOfChunks)
 	copyChannel := make([]chan int, numberOfChunks)
 	jobs := make(chan chunk, numberOfChunks)
-	for i := range copyChannel {
+	for i := 0; i < numberOfChunks; i++ {
 		copyChannel[i] = make(chan int)
-	}
-
-	go func() {
-		for i := range copyChannel {
-			currentChunk := <- copyChannel[i]
-			written, err := io.Copy(file, bytes.NewReader(downloadBuffers[currentChunk].Bytes()))
-			if err != nil {
-				finalErr = err
-			}
-			gplog.Verbose("Copied %d bytes (chunk %d) for file '%s'",
-				written, currentChunk, filepath.Base(fileKey))
-			waitGroup.Done()
-			close(copyChannel[i])
-		}
-	}()
-
-	for i := 0; i < Concurrency; i++ {
-		go func(id int) {
-			for j := range jobs {
-				chunkBytes, err := downloader.Download(
-					downloadBuffers[j.chunkIndex],
-					&s3.GetObjectInput{
-						Bucket: aws.String(bucket),
-						Key:    aws.String(fileKey),
-						Range:  aws.String(fmt.Sprintf("bytes=%d-%d", j.startByte, j.endByte)),
-					})
-				if err != nil {
-					finalErr = err
-				}
-				gplog.Verbose("Worker %d Downloaded %d bytes (chunk %d) for file '%s'",
-					id, chunkBytes, j.chunkIndex, filepath.Base(fileKey))
-				copyChannel[j.chunkIndex] <- j.chunkIndex
-			}
-		}(i)
 	}
 
 	startByte := int64(0)
 	endByte := int64(-1)
 	done := false
+	// Create jobs based on the number of chunks to be downloaded
 	for chunkIndex := 0; chunkIndex < numberOfChunks && !done; chunkIndex++ {
 		startByte = endByte + 1
 		endByte += DownloadChunkSize + int64(chunkIndex) * DownloadChunkIncrement
@@ -398,10 +361,55 @@ func downloadFileInParallel(downloader *s3manager.Downloader, totalBytes int64,
 		waitGroup.Add(1)
 	}
 
-	waitGroup.Wait()
-	elapsed := time.Since(start)
+	// Create a pool of download workers (based on concurrency)
+	numberOfWorkers := Concurrency
+	if numberOfChunks < Concurrency {
+		numberOfWorkers = numberOfChunks
+	}
+	for i := 0; i < numberOfWorkers; i++ {
+		go func(id int) {
+			for j := range jobs {
+				chunkStart := time.Now()
+				byteRange := fmt.Sprintf("bytes=%d-%d", j.startByte, j.endByte)
+				chunkBytes, err := downloader.Download(
+					downloadBuffers[j.chunkIndex],
+					&s3.GetObjectInput{
+						Bucket: aws.String(bucket),
+						Key:    aws.String(fileKey),
+						Range:  aws.String(byteRange),
+					})
+				if err != nil {
+					finalErr = err
+				}
+				gplog.Verbose("Worker %d Downloaded %d bytes (chunk %d) for %s in %v",
+					id, chunkBytes, j.chunkIndex, filepath.Base(fileKey),
+					time.Since(chunkStart).Round(time.Millisecond))
+				copyChannel[j.chunkIndex] <- j.chunkIndex
+				time.Sleep(time.Millisecond * 10)
+			}
+		}(i)
+	}
 
-	return totalBytes, elapsed, finalErr
+	// Copy data from download buffers into the output stream sequentially
+	go func() {
+		for i := range copyChannel {
+			currentChunk := <- copyChannel[i]
+			chunkStart := time.Now()
+			numBytes, err := file.Write(downloadBuffers[currentChunk].Bytes())
+			if err != nil {
+				finalErr = err
+			}
+			gplog.Verbose("Copied %d bytes (chunk %d) for %s in %v",
+				numBytes, currentChunk, filepath.Base(fileKey),
+				time.Since(chunkStart).Round(time.Millisecond))
+			waitGroup.Done()
+			close(copyChannel[i])
+		}
+	}()
+
+	waitGroup.Wait()
+
+	return totalBytes, time.Since(start), finalErr
 }
 
 func getFileSize(S3 s3iface.S3API, bucket string, fileKey string) (int64, error) {
