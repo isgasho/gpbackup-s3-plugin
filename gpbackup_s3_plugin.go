@@ -18,7 +18,8 @@ func main() {
 	}
 	app.Version = s3plugin.Version
 	app.Usage = ""
-	app.UsageText = "Not supported as a standalone utility.  This plugin must be used in conjunction with gpbackup and gprestore."
+	app.UsageText = "Not supported as a standalone utility. " +
+		"This plugin must be used in conjunction with gpbackup and gprestore."
 
 	app.Commands = []cli.Command{
 		{
@@ -47,9 +48,33 @@ func main() {
 			Before: buildBeforeFunc(2),
 		},
 		{
+			Name:   "backup_directory",
+			Action: s3plugin.BackupDirectory,
+			Before: buildBeforeFunc(2),
+			Hidden: true,
+		},
+		{
+			Name:   "backup_directory_parallel",
+			Action: s3plugin.BackupDirectoryParallel,
+			Before: buildBeforeFunc(2),
+			Hidden: true,
+		},
+		{
 			Name:   "restore_file",
 			Action: s3plugin.RestoreFile,
 			Before: buildBeforeFunc(2),
+		},
+		{
+			Name:   "restore_directory",
+			Action: s3plugin.RestoreDirectory,
+			Before: buildBeforeFunc(2),
+			Hidden: true,
+		},
+		{
+			Name:   "restore_directory_parallel",
+			Action: s3plugin.RestoreDirectoryParallel,
+			Before: buildBeforeFunc(2),
+			Hidden: true,
 		},
 		{
 			Name:   "backup_data",
