@@ -296,10 +296,14 @@ func downloadFile(sess *session.Session, bucket string, fileKey string,
 
 	go func() {
 		for currChunk := range copyChannel {
-			_, err = io.Copy(file, bytes.NewReader(downloadBuffers[currChunk].Bytes()))
+			chunkStart := time.Now()
+			numBytes, err := io.Copy(file, bytes.NewReader(downloadBuffers[currChunk].Bytes()))
 			if err != nil {
 				finalErr = err
 			}
+			gplog.Verbose("Copied %d bytes (chunk %d) for %s in %v",
+				numBytes, currChunk, filepath.Base(fileKey),
+				time.Since(chunkStart).Round(time.Millisecond))
 			waitGroup.Done()
 		}
 	}()
@@ -310,6 +314,7 @@ func downloadFile(sess *session.Session, bucket string, fileKey string,
 		if endByte > totalBytes {
 			endByte = totalBytes
 		}
+		chunkStart := time.Now()
 		_, err := downloader.Download(downloadBuffers[currentChunkNo], &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(fileKey),
@@ -319,6 +324,9 @@ func downloadFile(sess *session.Session, bucket string, fileKey string,
 			finalErr = err
 			break
 		}
+		gplog.Verbose("Downloaded %d bytes (chunk %d) for %s in %v",
+			endByte - startByte + 1, currentChunkNo, filepath.Base(fileKey),
+			time.Since(chunkStart).Round(time.Millisecond))
 		waitGroup.Add(1)
 		copyChannel <- currentChunkNo
 
